@@ -1,0 +1,791 @@
+library(shiny)
+library(dplyr)
+library(xgboost)
+library(caret)
+library(gtools)
+library(tidyverse)
+library(grid)
+library(DT)
+library(tidyr)
+library(shinythemes)
+
+
+# Copyright (C) Owen Moline-Freeman <owenmofree@gmail.com>
+pitch_grid <- read.csv("data/Perceived Vertical Break.csv", check.names = FALSE)
+hbreak_grid <- read.csv("data/Perceived Horz.csv", check.names = FALSE)
+
+
+correct_password <- "Insert password here"
+
+# ---- UI ----
+ui <- fluidPage(
+  theme = shinythemes::shinytheme("flatly"),
+  uiOutput("login_ui"), 
+  uiOutput("app_ui")    
+)
+
+
+server <- function(input, output, session) {
+  logged_in <- reactiveVal(FALSE)
+  
+  # Login UI
+  output$login_ui <- renderUI({
+    if (!logged_in()) {
+      fluidPage(
+        tags$head(
+          tags$style(HTML("
+          .top-right-logo {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            max-width: 100px;
+            height: auto;
+            z-index: 1000;
+          }
+        "))
+        ),
+        
+        tags$img(src = "usc_logo.png", class = "top-right-logo"),
+        
+        titlePanel("South Carolina Baseball Player Dev & Analytics"),
+        sidebarLayout(
+          sidebarPanel(
+            passwordInput("password", "Enter Password"),
+            actionButton("login_button", "Log In")
+          ),
+          mainPanel(
+            h4("Please enter the password to access the app.")
+          )
+        )
+      )
+    }
+  })
+  
+  
+ 
+  observeEvent(input$login_button, {
+    if (input$password == correct_password) {
+      logged_in(TRUE)
+      showNotification("Login successful!", type = "message")
+    } else {
+      showNotification("Incorrect password.", type = "error")
+    }
+  })
+  
+  
+  output$app_ui <- renderUI({
+    if (logged_in()) {
+      fluidPage(
+        
+        fluidRow(
+          column(12, align = "center",
+                 tags$div("Gamecock Baseball", 
+                          style = "font-family: 'Georgia'; font-size: 42px; font-weight: bold; color: black; margin-top: 10px;")
+          )   
+        ),
+        uiOutput("screen_ui")
+      )
+    }
+  })
+  
+  current_screen <- reactiveVal("home")
+  output$screen_ui <- renderUI({
+    if (current_screen() == "home") {
+      fluidPage(
+        tags$head(
+          tags$style(HTML("
+      .center-content {
+        text-align: center;
+        margin-top: 20px;
+      }
+      .logo-img {
+        max-width: 250px;
+        height: auto;
+        margin-bottom: 20px;
+      }
+    "))
+        ),
+        div(class = "center-content",
+            tags$a(
+              href = "Trumedia home page link", target = "_blank",
+              img(src = "usc_logo.png", class = "logo-img")
+            ),
+            (tags$div("Player Development & Analytics", 
+                     style = "font-family: 'Georgia'; font-size: 28px; font-weight: bold; color: black; margin-bottom: 15px;")),
+            actionButton("go_custom", "Perceived Pitch Shape - Custom"),
+            actionButton("go_grid", "OPS Matchup Grid"),
+            actionButton("go_portal_money", "Portal Money Estimator"),
+            actionButton("open_drive", "Scouting Reports", 
+                         onclick = "window.open('scouting report link', '_blank')")
+        )
+      )
+      
+      
+    } else if (current_screen() == "custom") {
+      fluidPage(
+        h2("Pitch Customizer"),
+        actionButton("back_home1", "Back to Home"),
+        sidebarLayout(
+          sidebarPanel(
+            sliderInput("release_height", "Release Height:", min = 4.5, max = 7, step = 0.1, value = 6),
+            sliderInput("release_side", "Release Side:", min = 0, max = 3, step = 0.1, value = 1, ticks = TRUE, animate = TRUE),
+            numericInput("vbreak", "Vertical Break:", value = 10, min = -20, max = 40),
+            numericInput("hbreak", "Horizontal Break:", value = 10, min = -30, max = 30),
+            numericInput("Spin", "Spin Rate:", value = 2000, min = 0, max = 3500),
+            numericInput("Velo", "Velocity:", value = 90, min = 0, max = 150),
+            numericInput("Ext", "Extension:", value = 6, min = 4, max = 8, step = 0.1),
+            actionButton("predict", "Predict xWOBA")
+          ),
+          mainPanel(
+            textOutput("pitch_type"),
+            textOutput("hbreak_type"),
+            textOutput("effective_velo"),
+            textOutput("prediction"),
+            plotOutput("dead_zone_plot"),
+            plotOutput("release_plot", height = "400px"),
+            plotOutput("strike_zone_plot", height = "400px")
+            
+            
+          )
+        )
+      )
+    } else if (current_screen() == "portal_money") {
+      fluidPage(
+        titlePanel("Portal Money Hub"),
+        actionButton("go_portal_hitters", "Hitter Portal Money"),
+        actionButton("go_portal_pitchers", "Pitcher Portal Money"),
+        actionButton("back_home_pm", "Back to Home")
+      )
+      
+    } else if (current_screen() == "portal_pitchers") {
+      fluidPage(
+        titlePanel("Pitcher Portal Money Estimator"),
+        actionButton("back_to_portal", "Back to Portal Money"),
+        sidebarLayout(
+          sidebarPanel(
+            fileInput("pitcher_salary_file", "Upload Pitcher CSV", accept = ".csv"),
+            selectInput("hand_filter", "Select Handedness:",
+                        choices = c("All", "Left", "Right"),
+                        selected = "All"),
+            
+            sliderInput("salary_range", "Salary Range:",
+                        min = 0, max = 1000000,  # Adjust max based on expected values
+                        value = c(0, 1000000), step = 5000, pre = "$", sep = ","),
+            actionButton("calc_salary", "Calculate Salaries"),
+            
+          ),
+          mainPanel(
+            DTOutput("salary_table")
+          )
+        )
+      )
+    
+    } else if (current_screen() == "grid") {
+      fluidPage(
+        titlePanel("Hitter vs Pitcher Matchup Grades (20-80 Scale)"),
+        actionButton("back_home2", "Back to Home"),
+        sidebarLayout(
+          sidebarPanel(
+            helpText("Displays matchup grades based on hitter and pitcher data."),
+            fileInput("pitcher_file", "Upload Pitcher CSV", accept = ".csv"),
+            fileInput("hitter_file", "Upload Hitter CSV", accept = ".csv"),
+            actionButton("run_btn", "Calculate Matchups"),
+            HTML("
+  <div style='margin-top: 20px;'>
+    <strong>Matchup Grade Key:</strong><br>
+    <div style='background-color: #007BFF; width: 20px; height: 20px; display: inline-block;'></div> 20-29 (Avoid Matchup)<br>
+    <div style='background-color: #87CEFA; width: 20px; height: 20px; display: inline-block;'></div> 30–44 (Avoid if Possible)<br>
+    <div style='background-color: #D3D3D3; width: 20px; height: 20px; display: inline-block;'></div> 45–55 (Neutral Matchup)<br>
+    <div style='background-color: #FF6961; width: 20px; height: 20px; display: inline-block;'></div> 56–70 (Target if Possible)<br>
+    <div style='background-color: #DC143C; width: 20px; height: 20px; display: inline-block;'></div> 71–80 (Target Matchup)<br>
+
+  </div>
+")
+            
+          ),
+          mainPanel(
+            tabsetPanel(
+              #tabPanel("Matchup Table", DTOutput("matchup_table")),
+              tabPanel("Matchup Grid", DTOutput("matchup_grid"))
+            )
+          )
+        )
+      )
+      
+    }
+  })
+  
+  # Screen navigation logic
+  
+  observeEvent(input$go_custom, { current_screen("custom") })
+  observeEvent(input$go_grid, { current_screen("grid") })
+  observeEvent(input$back_home1, { current_screen("home") })
+  observeEvent(input$back_home2, { current_screen("home") })
+  observeEvent(input$back_home_pm, { current_screen("home") })
+  observeEvent(input$back_to_portal, { current_screen("portal_money") })
+  observeEvent(input$go_portal_money, { current_screen("portal_money") })
+  observeEvent(input$go_portal_pitchers, { current_screen("portal_pitchers") })
+  observeEvent(input$go_portal_hitters, { current_screen("portal_hitters") })
+  
+
+  # Vertical Break prediction
+  pitch_result <- reactive({
+    if (!"Release_Height" %in% colnames(pitch_grid)) {
+      return("Data Error: Missing Release_Height column")
+    }
+    
+    closest_row <- pitch_grid %>%
+      slice_min(abs(Release_Height - input$release_height), n = 1)
+    
+    if (nrow(closest_row) == 0) {
+      return("No Data Available")
+    }
+    
+    release_side_fixed <- as.character(input$release_side)
+    low_col <- paste0(release_side_fixed, "_sink")
+    high_col <- paste0(release_side_fixed, "_lift")
+    
+    if (!(low_col %in% colnames(closest_row)) || !(high_col %in% colnames(closest_row))) {
+      return(paste("Invalid Release Side: Column", low_col, "or", high_col, "not found"))
+    }
+    
+    low_cutoff <- closest_row[[low_col]]
+    high_cutoff <- closest_row[[high_col]]
+    
+    if (input$vbreak <= low_cutoff) {
+      return("Sink")
+    } else if (input$vbreak >= high_cutoff) {
+      return("Ride")
+    } else {
+      return("Dead")
+    }
+  })
+  
+  # Horizontal break prediction
+  hbreak_result <- reactive({
+    if (!"Release_Height" %in% colnames(hbreak_grid)) {
+      return("Data Error: Missing Release_Height column in HBreak CSV")
+    }
+    
+    closest_row <- hbreak_grid %>%
+      slice_min(abs(Release_Height - input$release_height), n = 1)
+    
+    if (nrow(closest_row) == 0) {
+      return("No Data Available")
+    }
+    
+    release_side_fixed <- as.character(input$release_side)
+    cut_col <- paste0(release_side_fixed, "_Cut")
+    run_col <- paste0(release_side_fixed, "_Run")
+    
+    if (!(cut_col %in% colnames(closest_row)) || !(run_col %in% colnames(closest_row))) {
+      return(paste("Invalid Release Side: Column", cut_col, "or", run_col, "not found"))
+    }
+    
+    cut_cutoff <- closest_row[[cut_col]]
+    run_cutoff <- closest_row[[run_col]]
+    
+    if (input$hbreak <= cut_cutoff) {
+      return("Cut")
+    } else if (input$hbreak >= run_cutoff) {
+      return("Run")
+    } else {
+      return("Dead")
+    }
+  })
+  
+  # Effective velocity calculation
+  effective_velocity <- reactive({
+    input$Velo + ((input$Ext - 6.0) * 2.5)
+  })
+  
+  model <- readRDS("xWOBA Model RDS here")
+  
+  observeEvent(input$predict, {
+    newdata <- data.frame(
+      HorzBrk = input$hbreak,
+      Spin = input$Spin,
+      Extension = input$Ext,
+      Vel = input$Velo,
+      RelX = input$release_side,
+      RelZ = input$release_height,
+      IndVertBrk = input$vbreak
+    ) 
+    xWOBA <- predict(model, newdata = newdata)
+    output$prediction <- renderText({
+      paste("Predicted xWOBA", round(xWOBA, 3))
+    })
+  })
+  
+  # Render outputs
+  output$pitch_type <- renderText({
+    paste("Perceived Vertical Profile:", pitch_result())
+  })
+  
+  output$hbreak_type <- renderText({
+    paste("Perceived Horizontal Profile:", hbreak_result())
+  })
+  
+  output$effective_velo <- renderText({
+    paste("Effective Velocity:", round(effective_velocity(), 2), "MPH")
+  })
+  
+  output$release_plot <- renderPlot({
+    output$release_plot <- renderPlot({
+      output$release_plot <- renderPlot({
+        # Plot ranges
+        x_min <- 0
+        x_max <- 3
+        y_min <- 4.5
+        y_max <- 7
+        
+        # Heatmap center (hot spot)
+        hot_x <- 1.8   # release side (width)
+        hot_y <- 5.35   # release height (height)
+        
+        # Generate grid values
+        x_vals <- seq(x_min, x_max, length.out = 200)
+        y_vals <- seq(y_min, y_max, length.out = 200)
+        
+        # Generate heat values centered at (hot_x, hot_y)
+        heat_matrix <- outer(y_vals, x_vals, function(y, x) {
+          dist <- sqrt((x - hot_x)^2 + ((y - hot_y) / 1.5)^2)  # Shrinks vertical spread
+          exp(-dist * 1.5)
+        })
+        
+        
+        # Set color gradient: cooler on edges, hotter in center
+        heat_colors <- colorRampPalette(c("blue", "cornflowerblue", "lightblue", "yellow", "orange", "red"))(600)
+        
+        # Draw the heatmap background
+        image(
+          x = x_vals,
+          y = y_vals,
+          z = heat_matrix,
+          col = heat_colors,
+          xlab = "", ylab = "", axes = FALSE
+        )
+        
+        # Overlay main plot
+        par(new = TRUE)
+        plot(NA, xlim = c(x_min, x_max), ylim = c(y_min, y_max),
+             xlab = "Release Side (ft)", ylab = "Release Height (ft)",
+             main = "Release Point Visualization", xaxt = "n", yaxt = "n")
+        
+        # Add grid ticks
+        axis(1, at = seq(x_min, x_max, 0.5))
+        axis(2, at = seq(y_min, y_max, 0.5))
+        
+        # User input point
+        x_val <- input$release_side
+        y_val <- input$release_height
+        
+        # Guiding lines
+        abline(h = y_val, col = "black", lty = 2)
+        abline(v = x_val, col = "black", lty = 2)
+        
+        # Plot user release point
+        points(x_val, y_val, col = "black", pch = 19, cex = 1.5)
+        
+        # Static mid-plot labels
+        text(x = 1.5, y = 4.5, labels = "Over the Top ↔ Sidearm", col = "white")
+        text(x = 0, y = 5.75, labels = "Low ↔ High", srt = 90, col = "white")
+      })
+    })
+  })
+  
+  output$strike_zone_plot <- renderPlot({
+    closest_row <- pitch_grid %>%
+      slice_min(abs(Release_Height - input$release_height), n = 1)
+    
+    release_side_fixed <- as.character(input$release_side)
+    low_col <- paste0(release_side_fixed, "_sink")
+    high_col <- paste0(release_side_fixed, "_lift")
+    
+    if (!(low_col %in% colnames(closest_row)) || !(high_col %in% colnames(closest_row))) {
+      plot.new()
+      title("Invalid release side selected")
+      return()
+    }
+    
+    sink_cutoff <- closest_row[[low_col]]
+    ride_cutoff <- closest_row[[high_col]]
+    
+    zone_labels <- rep("Avoid here", 3)
+    names(zone_labels) <- c("bottom", "middle", "top")
+    
+    if (input$vbreak <= sink_cutoff) {
+      zone_labels["bottom"] <- "Success here"
+    } else if (input$vbreak >= ride_cutoff) {
+      zone_labels["top"] <- "Success here"
+    } else {
+      zone_labels[] <- "Neutral zone"
+    }
+    
+    par(mar = c(5, 4, 4, 2) + 0.1)
+    plot.new()
+    plot.window(xlim = c(1.5, 2.75), ylim = c(1.5, 3.5), asp = 1)
+    
+    rect(1.5, 1.5, 2.75, 2, col = ifelse(zone_labels["bottom"] == "Success here", "green",
+                                         ifelse(zone_labels["bottom"] == "Neutral zone", "lightgray", "red")), border = NA)
+    rect(1.5, 2, 2.75, 3, col = ifelse(zone_labels["middle"] == "Success here", "green",
+                                       ifelse(zone_labels["middle"] == "Neutral zone", "lightgray", "red")), border = NA)
+    rect(1.5, 3, 2.75, 3.5, col = ifelse(zone_labels["top"] == "Success here", "green",
+                                         ifelse(zone_labels["top"] == "Neutral zone", "lightgray", "red")), border = NA)
+    
+    rect(1.5, 1.5, 2.75, 3.5, border = "black", lwd = 2)
+    segments(1.5, 2, 2.75, 2, col = "black", lty = 2)
+    segments(1.5, 3, 2.75, 3, col = "black", lty = 2)
+    
+    text(2.125, 1.75, labels = zone_labels["bottom"], cex = 1, font = 1, col = "black")
+    text(2.125, 2.5, labels = zone_labels["middle"], cex = 1, font = 1, col = "black")
+    text(2.125, 3.25, labels = zone_labels["top"], cex = 1, font = 1, col = "black")
+    title(main = "Predicted In-Zone Success")
+    
+    
+    
+    output$dead_zone_plot <- renderPlot({
+    
+      hbreak_row <- hbreak_grid %>%
+        slice_min(abs(Release_Height - input$release_height), n = 1)
+      
+      release_side_fixed <- as.character(abs(as.numeric(input$release_side)))
+      cut_col  <- paste0(release_side_fixed, "_Cut")
+      run_col  <- paste0(release_side_fixed, "_Run")
+      
+      if (!(cut_col %in% colnames(hbreak_row)) || !(run_col %in% colnames(hbreak_row))) {
+        plot.new()
+        title("Invalid release side selected")
+        return()
+      }
+      
+      cut_cutoff <- hbreak_row[[cut_col]]
+      run_cutoff <- hbreak_row[[run_col]]
+      
+        
+      ride_line <- (ride_cutoff)/35
+      sink_line <- (sink_cutoff)/35
+      cut_line  <- (cut_cutoff)/25
+      run_line  <- (run_cutoff)/25
+      
+      
+      star_x <- (input$hbreak)/25
+      star_y <- (input$vbreak)/35
+      
+      
+      labels <- c("Cut-Ride", "Ride", "Ride-Run",
+                  "Cutter", "Dead", "Runner",
+                  "Cut-Sink", "Dead-Sink", "Sinker")
+      
+      # Start new plot
+      grid.newpage()
+      grid.rect(gp = gpar(col = "black", fill = NA))
+      
+      # Draw cutoff lines
+      grid.lines(x = unit(c(0, 1), "npc"), y = unit(c(ride_line, ride_line), "npc"), gp = gpar(col = "black", lwd = 2))
+      grid.lines(x = unit(c(0, 1), "npc"), y = unit(c(sink_line, sink_line), "npc"), gp = gpar(col = "black", lwd = 2))
+      grid.lines(y = unit(c(0, 1), "npc"), x = unit(c(cut_line, cut_line), "npc"), gp = gpar(col = "black", lwd = 2))
+      grid.lines(y = unit(c(0, 1), "npc"), x = unit(c(run_line, run_line), "npc"), gp = gpar(col = "black", lwd = 2))
+      
+      # Define cell bounds
+      x_bounds <- c(0, cut_line, run_line, 1)
+      y_bounds <- c(1, ride_line, sink_line, 0)
+      
+      # Add labels
+      label_index <- 1
+      for (i in 1:3) {
+        for (j in 1:3) {
+          x_mid <- (x_bounds[j] + x_bounds[j+1]) / 2
+          y_mid <- (y_bounds[i] + y_bounds[i+1]) / 2
+          grid.text(labels[label_index], x = unit(x_mid, "npc"), y = unit(y_mid, "npc"))
+          label_index <- label_index + 1
+        }
+      }
+      
+      
+      grid.text("*", x = unit(star_x, "npc"), y = unit(star_y, "npc"), gp = gpar(col = "red", fontsize = 30, fontface = "bold"))
+    })  
+    
+  })
+  
+ 
+  pitch_shape_data <- reactive({
+    req(input$pitcher_file)
+    
+    data <- read.csv(input$pitcher_file$datapath, check.names = FALSE)
+
+    required_cols <- c("playerFullName", "REL", "Rel side", 
+                       "FB IVB", "FB HB", 
+                       "avg FB vel", "FB SPIN", "Extension")
+    validate(
+      need(all(required_cols %in% colnames(data)), 
+           paste("Missing columns:", paste(setdiff(required_cols, colnames(data)), collapse = ", ")))
+    )
+    
+    return(data)
+  })
+  
+  output$debug_pitcher_cols <- renderPrint({ 
+  req(input$pitcher_file)
+    data <- read.csv(input$pitcher_file$datapath, check.names = FALSE)
+    colnames(data)
+  })
+  output$pitcher_dropdown <- renderUI({
+    df <- pitch_shape_data()
+    selectInput("selected_pitcher", "Choose Pitcher", choices = unique(df$playerFullName))
+  })
+  output$pitcher_selected_data <- renderTable({
+    req(input$selected_pitcher)
+    df <- pitch_shape_data()
+    
+    df[df$playerFullName == input$selected_pitcher,
+       c("playerFullName", "REL", "Rel side", 
+         "FB IVB", "FB HB", 
+         "avg FB vel", "FB SPIN", "Extension")]
+  })
+  
+  convert_to_grade <- function(ops) {
+    grade <- 50 - 10 * ((ops - 0.8)/0.1)
+    grade <- round(grade)
+    return(pmin(pmax(grade, 20), 80))
+  }
+  
+  calculate_matchup <- function(hitter_row, pitcher_row) {
+    hitter_hand <- hitter_row$batsHand
+    pitcher_hand <- pitcher_row$throwsHand
+    
+    if (hitter_hand == "S") {
+      hitter_vs_hand <- ifelse(pitcher_hand == "L", "RHP", "LHP")
+      pitcher_vs_hand <- ifelse(pitcher_hand == "L", "RHH", "LHH")
+    } else if (hitter_hand == "L") {
+      hitter_vs_hand <- "LHP"
+      pitcher_vs_hand <- "LHH"
+    } else if (hitter_hand == "R") {
+      hitter_vs_hand <- "RHP"
+      pitcher_vs_hand <- "RHH"
+    } else {
+      return(NA_real_)
+    }
+    
+    pitch_types <- c("FastLift", "FastSink", "Cut", "Change", "Sweep", "Depth")
+    
+    get_val <- function(pitch_type) {
+      pitch_pct_col <- paste0(pitch_type, " % vs ", pitcher_vs_hand)
+      pitcher_val_col <- paste0(pitch_type, " OPS vs ", pitcher_vs_hand)
+      hitter_val_col <- paste0("OPS vs ", pitch_type, " vs ", hitter_vs_hand)
+      
+      pitch_pct <- pitcher_row[[pitch_pct_col]]
+      pitcher_val <- pitcher_row[[pitcher_val_col]]
+      hitter_val <- hitter_row[[hitter_val_col]]
+      
+      if (any(is.na(c(pitch_pct, pitcher_val, hitter_val)))) return(0)
+      
+      return(pitch_pct * (0.5 * hitter_val + 0.5 * pitcher_val))
+    }
+    
+    total <- sum(sapply(pitch_types, get_val))
+    return(total)
+  }
+  observeEvent(input$run_btn, {
+    req(input$pitcher_file, input$hitter_file)
+    
+    pitchers <- read_csv(input$pitcher_file$datapath)
+    hitters  <- read_csv(input$hitter_file$datapath)
+    
+    
+    pitch_pct_cols <- grep("% vs", colnames(pitchers), value = TRUE)
+    pitchers <- pitchers %>% mutate(across(all_of(pitch_pct_cols), ~ as.numeric(gsub("[^0-9.]", "", as.character(.))) / 100))
+       
+    pitcher_ops_cols <- grep("OPS vs", colnames(pitchers), value = TRUE)
+    pitchers <- pitchers %>%
+      mutate(across(all_of(pitcher_ops_cols), as.character)) %>%
+      mutate(across(all_of(pitcher_ops_cols), ~ na_if(., "-"))) %>%
+      mutate(across(all_of(pitcher_ops_cols), as.numeric))
+
+    ops_cols <- grep("^OPS vs", colnames(hitters), value = TRUE)
+    hitters <- hitters %>%
+      mutate(across(all_of(ops_cols), as.character)) %>%
+      mutate(across(all_of(ops_cols), ~ na_if(., "-"))) %>%
+      mutate(across(all_of(ops_cols), as.numeric)) %>%
+      mutate(across(all_of(ops_cols), ~ if_else(is.na(.), OPS, .)))
+    
+    matchup_results <- expand.grid(hitter_index = 1:nrow(hitters),
+                                   pitcher_index = 1:nrow(pitchers)) %>%
+      rowwise() %>%
+      mutate(
+        Hitter = hitters[hitter_index, ]$playerFullName,
+        Pitcher = pitchers[pitcher_index, ]$playerFullName,
+        Matchup_Score = calculate_matchup(hitters[hitter_index, ], pitchers[pitcher_index, ])
+      ) %>%
+      ungroup() %>%
+      mutate(
+        Matchup_OPS = Matchup_Score,
+        Grade_20_80 = convert_to_grade(Matchup_OPS)
+      )
+
+    output$matchup_table <- renderDT({
+      datatable(matchup_results %>% select(Hitter, Pitcher, Matchup_OPS, Grade_20_80),
+                options = list(pageLength = 15),
+                rownames = FALSE)
+    })
+    
+    # Grid view (pivoted wide format)
+    # Grid view (pivoted wide format)
+    output$matchup_grid <- renderDT({
+      matchup_results_clean <- matchup_results %>%
+        select(Pitcher, Hitter, Grade_20_80) %>%
+        distinct(Pitcher, Hitter, .keep_all = TRUE)
+      
+      matchup_grid <- matchup_results_clean %>%
+        pivot_wider(names_from = Pitcher, values_from = Grade_20_80)
+
+      pitcher_cols <- colnames(matchup_grid)[colnames(matchup_grid) != "Hitter"]
+      
+      datatable(matchup_grid, options = list(scrollX = TRUE), rownames = FALSE) %>%
+        formatStyle(
+          columns = pitcher_cols,
+          backgroundColor = styleInterval(
+            c(29,44, 55, 70),  # breakpoints for coloring
+            c('#007BFF','#87CEFA', '#D3D3D3', '#FF6961', '#DC143C')  
+          ),
+          color = "black"
+        )
+    })
+    
+  })
+
+    salary_results <- reactiveVal()
+    salary_results <- reactiveVal()
+    salary_results_raw <- reactiveVal()
+
+    observeEvent(input$calc_salary, {
+      req(input$pitcher_salary_file)
+      
+      pitchers <- read.csv(input$pitcher_salary_file$datapath, stringsAsFactors = FALSE)
+      
+      # Validate columns
+      validate(
+        need("avgFBvel" %in% names(pitchers), "'avgFBvel' column is missing"),
+        need("pWAR" %in% names(pitchers), "'pWAR' column is missing")
+      )
+
+      pitchers[["avgFBvel"]] <- ifelse(pitchers[["avgFBvel"]] == "-", NA, pitchers[["avgFBvel"]])
+      colnames(pitchers)[colnames(pitchers) == "avgFBvel"] <- "avg_FB_vel"
+      colnames(pitchers)[colnames(pitchers) == "throwsHand"] <- "ThrowsHand"
+      pitchers$avg_FB_vel <- suppressWarnings(as.numeric(pitchers$avg_FB_vel))
+      pitchers$pWAR <- suppressWarnings(as.numeric(pitchers$pWAR))
+      pitchers <- pitchers[!is.na(pitchers$avg_FB_vel), ]
+      req(nrow(pitchers) > 0)
+      
+      pitchers$VeloMultiplier <- ifelse(
+        pitchers$avg_FB_vel >= 90,
+        exp(0.075 * (pitchers$avg_FB_vel - 90)),
+        1 + (pitchers$avg_FB_vel - 89.5) * 0.75
+      )
+
+      BaseSalary <- 25000
+      pWARFactor <- 1.80
+      pitchers$AdjustedpWAR <- ifelse(pitchers$pWAR > 0, log1p(pitchers$pWAR), 0)
+      pitchers$PredictedSalary <- BaseSalary * (1 + pitchers$AdjustedpWAR * pWARFactor) * pitchers$VeloMultiplier
+      pitchers$PredictedSalary <- pmax(pitchers$PredictedSalary, 0)
+      pitchers <- pitchers[order(-pitchers$PredictedSalary), ]
+      pitchers$Rank <- 1:nrow(pitchers)
+
+      pitchers$RankMultiplier <- with(pitchers, ifelse(
+        Rank <= 10, 4.5 - (Rank - 1) * 0.015,
+        ifelse(Rank <= 20, 3.8 - (Rank - 11) * 0.02,
+               ifelse(Rank <= 30, 3.5 - (Rank - 21) * 0.015,
+                      ifelse(Rank <= 40, 3 - (Rank - 31) * 0.013,
+                             ifelse(Rank <= 50, 2.8 - (Rank - 41) * 0.012,
+                                    ifelse(Rank <= 100, 2.69 - (Rank - 51) * 0.006,
+                                           ifelse(Rank <= 150, 2.1 - (Rank - 101) * 0.002,
+                                                  ifelse(Rank <= 200, 1.6 - (Rank - 151) * 0.001,
+                                                         1.0)))))))))
+    
+pitchers$RankMultiplier <- pmax(pitchers$RankMultiplier, 1.0)
+
+pitchers$RankAdjustedSalary <- pitchers$PredictedSalary * pitchers$RankMultiplier
+
+
+pitchers$FormattedSalary <- paste0(
+  "$", format(round(pitchers$RankAdjustedSalary, 0), big.mark = ",")
+)
+
+pitchers <- pitchers[order(-pitchers$RankAdjustedSalary), ]
+pitchers$Rank <- 1:nrow(pitchers)
+
+pitchers_final <- pitchers[, c("Rank", "playerFullName", "ThrowsHand", "pWAR", "avg_FB_vel", "newestTeamName", "FormattedSalary")]
+colnames(pitchers_final)[colnames(pitchers_final) == "FormattedSalary"] <- "Estimated Salary"
+
+salary_results_raw(pitchers)
+
+salary_results_raw(pitchers)  # This has playerFullName
+
+pitchers_final <- pitchers[, c(
+  "Rank", "playerFullName", "ThrowsHand", "pWAR", 
+  "avg_FB_vel", "newestTeamName", "FormattedSalary"
+)]
+
+colnames(pitchers_final) <- c(
+  "Rank",
+  "Name",
+  "Throws",
+  "Projected WAR",
+  "FB Velocity (mph)",
+  "Team",
+  "Estimated Salary"
+)
+
+salary_results(pitchers_final)
+
+    })
+
+    filtered_pitchers <- reactive({
+      req(salary_results(), salary_results_raw())
+  
+      raw <- salary_results_raw()
+
+      if (input$hand_filter != "All") {
+        raw <- raw[raw$ThrowsHand == substr(input$hand_filter, 1, 1), ]
+      }
+
+      raw <- raw[
+        raw$RankAdjustedSalary >= input$salary_range[1] &
+          raw$RankAdjustedSalary <= input$salary_range[2],
+      ]
+
+      display <- salary_results()
+      filtered <- display[display$Name %in% raw$playerFullName, ]
+      
+      filtered
+    })
+    
+    output$salary_table <- DT::renderDT({
+      DT::datatable(
+        filtered_pitchers(),
+        options = list(pageLength = 25, scrollX = TRUE),
+        rownames = FALSE
+      ) %>%
+        DT::formatStyle(
+          columns = names(filtered_pitchers()),  # Center all columns
+          textAlign = "center"
+        )
+    })
+
+observe({
+  req(salary_results_raw())
+  max_salary <- ceiling(max(salary_results_raw()$RankAdjustedSalary, na.rm = TRUE) / 5000) * 5000
+  updateSliderInput(session, "salary_range",
+                    min = 0,
+                    max = max_salary,
+                    value = c(0, max_salary))
+})
+
+  }
+  
+  
+  
+  
+
+
+shinyApp(ui, server)
